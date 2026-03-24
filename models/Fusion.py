@@ -18,7 +18,7 @@ class CrossModalAttention(nn.Module):
 
         self.rel_scale = nn.Parameter(torch.tensor(0.5))  # 初始值可以小一些
 
-        self.out = nn.Linear(hidden_dim, feature_dim)
+        self.out = nn.Linear(hidden_dim * 2, feature_dim)
 
     def forward(self, rgb_feat, ir_feat, w_rgb, w_ir):
 
