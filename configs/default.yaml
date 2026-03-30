@@ -1,0 +1,34 @@
+# configs/default.yaml
+data:
+  rgb_dir: "/rgb/videos"   # rgb路径
+  ir_dir: "/ir/videos"     # ir路径
+  batch_size: 8
+  num_workers: 4
+  slow_num_frames: 8
+  fast_num_frames: 32
+  side_size: 256
+
+model:
+  feature_dim: 2304                     # SlowFast输出特征维度，根据实际模型调整
+  num_classes: 60                       # NTU RGB+D 类别数
+  rgb_weight: "pretrained/slowfast_r50_kinetics.pyth"
+  ir_weight: null                       # IR 分支权重，若None则随机初始化
+  dropout: 0.5
+  hidden_dim: 512                       # 分类头隐藏层维度，None则单层
+
+train:
+  epochs: 50
+  lr: 1e-4
+  weight_decay: 1e-4
+  warmup_epochs: 5
+  grad_clip: 1.0
+  use_amp: true                         # 混合精度训练
+  seed: 42
+  save_dir: "checkpoints"
+  log_interval: 10
+  eval_interval: 1
+
+wandb:
+  project: "multimodal-behavior-recognition"
+  entity: null                          # 可选
+  name: null                            # 自动生成
