@@ -30,11 +30,12 @@ class CrossModalAttention(nn.Module):
         attn = torch.matmul(Q, K.transpose(-2,-1))
         attn = attn / (Q.shape[-1] ** 0.5)
 
-        reliability = torch.cat([w_rgb, w_ir], dim=1)
-        reliability = torch.log(reliability + 1e-6)           # log(probability)
-        reliability = reliability.unsqueeze(1)
+        if w_ir and w_rgb is not None:
+            reliability = torch.cat([w_rgb, w_ir], dim=1)
+            reliability = torch.log(reliability + 1e-6)           # log(probability)
+            reliability = reliability.unsqueeze(1)
 
-        attn = attn + self.rel_scale * reliability
+            attn = attn + self.rel_scale * reliability
 
         attn = F.softmax(attn, dim=-1)
 
