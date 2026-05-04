@@ -53,7 +53,7 @@ class NTUDataset(Dataset):
         for i, (rgb_path, _) in enumerate(self.pairs):
             name = rgb_path.stem
             a = int(name.split("A")[-1].split("_")[0])
-            label_map[i] = a
+            label_map[i] = a - 1  # 标签从 0 开始
         return label_map
 
     def _get_transform(self, num_frames, is_rgb=True, is_slow=True):

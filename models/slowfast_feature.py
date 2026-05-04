@@ -15,10 +15,10 @@ class SlowFastFeatureExtractor(nn.Module):
             model_num_class=400,
             slowfast_channel_reduction_ratio=8,
             slowfast_conv_channel_fusion_ratio=2,
+            head_pool=torch.nn.AdaptiveAvgPool3d,  # 改为自适应池化，支持任意帧数
+            head_output_size=(1, 1, 1),
         )
 
-        # 去掉分类层
-        self.model.blocks[-1] = nn.Identity()
 
         # 加载权重
         if weight_path is not None:
@@ -29,6 +29,9 @@ class SlowFastFeatureExtractor(nn.Module):
                 checkpoint = checkpoint["model_state"]
 
             self.model.load_state_dict(checkpoint, strict=False)
+
+        #去掉分类头
+        self.model.blocks[-1] = nn.Identity()
 
         # 冻结参数
         if freeze:

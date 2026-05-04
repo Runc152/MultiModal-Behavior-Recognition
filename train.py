@@ -1,37 +1,29 @@
-#!/usr/bin/env python
-# train.py
-
 import argparse
 import os
-import random
 import yaml
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import GradScaler, autocast
-import wandb
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-# 导入项目自定义模块
+# Import project-specific modules
 from datasets.ntu_dataset import NTUDataset
-from models.multimodal_slowfast import RGBIRSlowFast
-from models.Fusion import Reliability, CrossModalAttention
-from models.ClassificationHead import ClassificationHead
+from models.multimodal_model import MultiModalModel
 from utils.metrics import accuracy
 
 
-
 def load_config(config_path):
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     return config
 
 
 def create_dataloaders(config):
-    """创建训练和验证 DataLoader"""
+    """Create train and validation DataLoaders."""
     dataset = NTUDataset(
         rgb_dir=config['data']['rgb_dir'],
         ir_dir=config['data']['ir_dir'],
@@ -40,7 +32,7 @@ def create_dataloaders(config):
         side_size=config['data']['side_size']
     )
 
-    # 按比例划分训练/验证集
+    # Split dataset into training and validation sets
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -50,51 +42,87 @@ def create_dataloaders(config):
         batch_size=config['data']['batch_size'],
         shuffle=True,
         num_workers=config['data']['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=filter_invalid_collate 
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['data']['batch_size'],
         shuffle=False,
         num_workers=config['data']['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=filter_invalid_collate  
     )
     return train_loader, val_loader
 
 
 def create_model(config, device):
-    """实例化所有模型模块并移动到设备"""
-    # 双模态特征提取器
-    rgb_extractor = RGBIRSlowFast(
+    """Create the model and move it to the target device."""
+    model = MultiModalModel(
+        use_reliability=config['model'].get('use_reliability', True),
         rgb_weight=config['model']['rgb_weight'],
         ir_weight=config['model']['ir_weight'],
-        device=device
-    )
-
-    # 可靠性评估模块
-    reliability = Reliability(feature_dim=config['model']['feature_dim']).to(device)
-
-    # 跨模态注意力融合
-    cross_attn = CrossModalAttention(feature_dim=config['model']['feature_dim']).to(device)
-
-    # 分类头
-    classifier = ClassificationHead(
-        input_dim=config['model']['feature_dim'],
-        num_classes=config['model']['num_classes'],
+        feature_dim=config['model']['feature_dim'],
         hidden_dim=config['model']['hidden_dim'],
-        dropout=config['model']['dropout']
+        num_classes=config['model']['num_classes']
     ).to(device)
+    return model
 
-    return rgb_extractor, reliability, cross_attn, classifier
+
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_acc1, config, tb_log_dir):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'best_acc1': best_acc1,
+        'config': config,
+        'tb_log_dir': tb_log_dir
+    }
+    torch.save(checkpoint, path)
 
 
-def train_one_epoch(model, reliability, cross_attn, classifier,
-                    dataloader, optimizer, criterion, scaler, device, config):
-    """单轮训练"""
+def load_checkpoint(resume_path, model, optimizer=None, scheduler=None, scaler=None,
+                    device='cpu', load_optimizer=True):
+    """Load a checkpoint, optionally restoring optimizer state."""
+    checkpoint = torch.load(resume_path, map_location=device)
+
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+
+    start_epoch = 1
+    best_acc1 = 0.0
+    tb_log_dir = None
+
+    if 'epoch' in checkpoint:
+        start_epoch = checkpoint['epoch'] + 1
+    if 'best_acc1' in checkpoint:
+        best_acc1 = checkpoint['best_acc1']
+
+    # Optionally restore optimizer, scheduler, and AMP scaler
+    if load_optimizer and optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if load_optimizer and scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    if load_optimizer and scaler is not None and checkpoint.get('scaler_state_dict') is not None:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    
+    if 'tb_log_dir' in checkpoint:
+        tb_log_dir = checkpoint['tb_log_dir']
+
+    print(f"Successfully loaded checkpoint: {resume_path}")
+    print(f"Resuming from epoch {start_epoch}, current best_acc1 = {best_acc1:.2f}")
+
+    return start_epoch, best_acc1, tb_log_dir
+
+
+def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, config):
+    """Train the model for one epoch."""
     model.train()
-    reliability.train()
-    cross_attn.train()
-    classifier.train()
 
     total_loss = 0
     total_acc1 = 0
@@ -102,39 +130,30 @@ def train_one_epoch(model, reliability, cross_attn, classifier,
 
     pbar = tqdm(dataloader, desc='Training', leave=False)
     for batch in pbar:
-        # 将数据移到设备
+        # Move batch data to the device
         rgb_slow = batch['rgb_slow'].to(device)
         rgb_fast = batch['rgb_fast'].to(device)
         ir_slow = batch['ir_slow'].to(device)
         ir_fast = batch['ir_fast'].to(device)
         labels = batch['label'].to(device)
 
-        # 混合精度上下文
+        optimizer.zero_grad()
+
+        # Forward pass
         with autocast(enabled=config['train']['use_amp']):
-            # 提取特征
-            rgb_feat, ir_feat = model(rgb=[rgb_slow, rgb_fast], ir=[ir_slow, ir_fast])
+            # Get multi-modal feature predictions
+            logits = model(rgb=[rgb_slow, rgb_fast], ir=[ir_slow, ir_fast])
 
-            # 可靠性评估
-            w_rgb, w_ir = reliability(rgb_feat, ir_feat)
-
-            # 跨模态融合
-            fused_feat = cross_attn(rgb_feat, ir_feat, w_rgb, w_ir)
-
-            # 分类
-            logits = classifier(fused_feat)
-
-            # 损失
+            # Compute loss
             loss = criterion(logits, labels)
 
-        # 反向传播
-        optimizer.zero_grad()
+        # Backpropagate gradients
         if config['train']['use_amp']:
             scaler.scale(loss).backward()
             if config['train']['grad_clip'] > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(reliability.parameters()) +
-                    list(cross_attn.parameters()) + list(classifier.parameters()),
+                    model.parameters(),
                     config['train']['grad_clip']
                 )
             scaler.step(optimizer)
@@ -143,19 +162,18 @@ def train_one_epoch(model, reliability, cross_attn, classifier,
             loss.backward()
             if config['train']['grad_clip'] > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(reliability.parameters()) +
-                    list(cross_attn.parameters()) + list(classifier.parameters()),
+                    model.parameters(),
                     config['train']['grad_clip']
                 )
             optimizer.step()
 
-        # 记录指标
+        # Record metrics
         acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
         total_loss += loss.item()
         total_acc1 += acc1.item()
         total_acc5 += acc5.item()
 
-        pbar.set_postfix(loss=loss.item(), acc1=acc1.item())
+        pbar.set_postfix(loss=loss.item(), acc1=acc1.item(), acc5=acc5.item())
 
     avg_loss = total_loss / len(dataloader)
     avg_acc1 = total_acc1 / len(dataloader)
@@ -164,13 +182,9 @@ def train_one_epoch(model, reliability, cross_attn, classifier,
 
 
 @torch.no_grad()
-def validate(model, reliability, cross_attn, classifier,
-             dataloader, criterion, device, config):
-    """验证"""
+def validate(model, dataloader, criterion, device, config):
+    """Validate the model."""
     model.eval()
-    reliability.eval()
-    cross_attn.eval()
-    classifier.eval()
 
     total_loss = 0
     total_acc1 = 0
@@ -185,10 +199,7 @@ def validate(model, reliability, cross_attn, classifier,
         labels = batch['label'].to(device)
 
         with autocast(enabled=config['train']['use_amp']):
-            rgb_feat, ir_feat = model(rgb=[rgb_slow, rgb_fast], ir=[ir_slow, ir_fast])
-            w_rgb, w_ir = reliability(rgb_feat, ir_feat)
-            fused_feat = cross_attn(rgb_feat, ir_feat, w_rgb, w_ir)
-            logits = classifier(fused_feat)
+            logits = model(rgb=[rgb_slow, rgb_fast], ir=[ir_slow, ir_fast])
             loss = criterion(logits, labels)
 
         acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
@@ -202,106 +213,142 @@ def validate(model, reliability, cross_attn, classifier,
     return avg_loss, avg_acc1, avg_acc5
 
 
-def main(config_path):
-    # 加载配置
+def filter_invalid_collate(batch):
+    """自定义 collate 函数：过滤掉 label==-1 的无效样本"""
+    if not batch:
+        return {}
+    
+    # 过滤出有效样本
+    valid_samples = [sample for sample in batch if sample['label'] != -1]
+    
+    if not valid_samples:
+        # 如果 batch 中没有有效样本，返回空字典
+        return {}
+    
+    # 将有效样本堆叠成张量
+    keys = valid_samples[0].keys()
+    collated_batch = {}
+    for key in keys:
+        collated_batch[key] = torch.stack([sample[key] for sample in valid_samples])
+    
+    return collated_batch
+
+
+def main(config_path, resume_path=None, load_optimizer=True):
+    # Load configuration
     config = load_config(config_path)
 
-    # 初始化 wandb
-    wandb.init(
-        project=config['wandb']['project'],
-        entity=config['wandb']['entity'],
-        name=config['wandb']['name'],
-        config=config
-    )
 
-    # 设备
+    tb_log_dir = config['tensorboard']['log_dir']
+
+    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # 数据加载
+    # Data loading
     train_loader, val_loader = create_dataloaders(config)
     print(f"Train samples: {len(train_loader.dataset)}, Val samples: {len(val_loader.dataset)}")
 
-    # 模型
-    model, reliability, cross_attn, classifier = create_model(config, device)
+    # Model
+    model = create_model(config, device)
 
-    # 优化器（只训练需要梯度的参数）
-    params = (list(model.parameters()) +
-              list(reliability.parameters()) +
-              list(cross_attn.parameters()) +
-              list(classifier.parameters()))
-    optimizer = AdamW(params, lr=config['train']['lr'], weight_decay=config['train']['weight_decay'])
+    # Optimizer
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config['train']['lr'],
+        weight_decay=config['train']['weight_decay']
+    )
 
-    # 学习率调度（预热 + 余弦衰减）
+    # Learning rate schedule (warmup + cosine annealing)
     warmup_epochs = config['train']['warmup_epochs']
     total_epochs = config['train']['epochs']
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 
-    # 损失函数
+    # Loss function
     criterion = nn.CrossEntropyLoss()
 
-    # 混合精度 scaler
+    # Mixed precision scaler
     scaler = GradScaler(enabled=config['train']['use_amp'])
 
-    # 保存目录
+    # Create save directory
     os.makedirs(config['train']['save_dir'], exist_ok=True)
 
+    # Default training state
+    start_epoch = 1
     best_acc1 = 0.0
-    for epoch in range(1, total_epochs + 1):
+
+    # If no resume path is provided, try the one in config
+    if resume_path is None:
+        resume_path = config['train'].get('resume_path', None)
+
+    # Resume training / load checkpoint
+    if resume_path:
+        start_epoch, best_acc1, tb_log_dir = load_checkpoint(
+            resume_path=resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+            load_optimizer=load_optimizer
+        )
+        # If checkpoint doesn't have tb_log_dir, use the one from config
+        if tb_log_dir is None:
+            tb_log_dir = config['tensorboard']['log_dir']
+
+    tb_writer = SummaryWriter(log_dir=tb_log_dir)
+
+    for epoch in range(start_epoch, total_epochs + 1):
         print(f"\nEpoch {epoch}/{total_epochs}")
 
-        # 训练
+        # Train
         train_loss, train_acc1, train_acc5 = train_one_epoch(
-            model, reliability, cross_attn, classifier,
-            train_loader, optimizer, criterion, scaler, device, config
+            model, train_loader, optimizer, criterion, scaler, device, config
         )
-        wandb.log({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'train_acc1': train_acc1,
-            'train_acc5': train_acc5,
-            'lr': optimizer.param_groups[0]['lr']
-        })
+        
+        tb_writer.add_scalar('Loss/Train', train_loss, epoch)
+        tb_writer.add_scalar('Accuracy/Train_top1', train_acc1, epoch)
+        tb_writer.add_scalar('Accuracy/Train_top5', train_acc5, epoch)
 
-        # 验证
+        # Validate
         if epoch % config['train']['eval_interval'] == 0:
             val_loss, val_acc1, val_acc5 = validate(
-                model, reliability, cross_attn, classifier,
-                val_loader, criterion, device, config
+                model, val_loader, criterion, device, config
             )
-            wandb.log({
-                'val_loss': val_loss,
-                'val_acc1': val_acc1,
-                'val_acc5': val_acc5
-            })
+
+            tb_writer.add_scalar('Loss/Val', val_loss, epoch)
+            tb_writer.add_scalar('Accuracy/Val_top1', val_acc1, epoch)
+            tb_writer.add_scalar('Accuracy/Val_top5', val_acc5, epoch)
             print(f"Val Loss: {val_loss:.4f}, Acc@1: {val_acc1:.2f}%, Acc@5: {val_acc5:.2f}%")
 
-            # 保存最佳模型
+            # Always save the latest checkpoint during validation
+            latest_path = os.path.join(config['train']['save_dir'], 'latest_model.pth')
+            save_checkpoint(latest_path, model, optimizer, scheduler, scaler, epoch, best_acc1, config, tb_log_dir)
+
+            # Save the best checkpoint
             if val_acc1 > best_acc1:
                 best_acc1 = val_acc1
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'reliability_state_dict': reliability.state_dict(),
-                    'cross_attn_state_dict': cross_attn.state_dict(),
-                    'classifier_state_dict': classifier.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_acc1': best_acc1,
-                    'config': config
-                }
-                torch.save(checkpoint, os.path.join(config['train']['save_dir'], 'best_model.pth'))
+                best_path = os.path.join(config['train']['save_dir'], 'best_model.pth')
+                save_checkpoint(best_path, model, optimizer, scheduler, scaler, epoch, best_acc1, config, tb_log_dir)
                 print(f"New best model saved with Acc@1: {best_acc1:.2f}%")
 
-        # 更新学习率
+        # Update scheduler
         scheduler.step()
 
-    wandb.finish()
+    tb_writer.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train MultiModal Behavior Recognition')
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint')
+    parser.add_argument('--only_load_weights', action='store_true', help='Only load model weights')
     args = parser.parse_args()
-    main(args.config)
+
+    main(
+        config_path=args.config,
+        resume_path=args.resume,
+        load_optimizer=not args.only_load_weights
+    )
