@@ -17,7 +17,7 @@ model:
   hidden_dim: 512                       # 分类头隐藏层维度，None则单层
   use_reliability: true
 train:
-  epochs: 10
+  epochs: 25
   lr: 0.0001
   weight_decay: 0.0001
   warmup_epochs: 5

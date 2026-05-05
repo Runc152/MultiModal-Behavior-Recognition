@@ -9,6 +9,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+import random
+import numpy as np
 
 # Import project-specific modules
 from datasets.ntu_dataset import NTUDataset
@@ -238,6 +240,12 @@ def main(config_path, resume_path=None, load_optimizer=True):
     # Load configuration
     config = load_config(config_path)
 
+    seed = config['train'].get('seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     tb_log_dir = config['tensorboard']['log_dir']
 
