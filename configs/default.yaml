@@ -1,37 +1,39 @@
 # configs/default.yaml
 data:
-  rgb_dir: "datasets/NTU/RGB/original/nturgbd_rgb_s001"   # rgb路径
-  ir_dir: "datasets/NTU/IR/original_ir/nturgbd_ir_s001"     # ir路径
-  batch_size: 4
-  num_workers: 0
-  slow_num_frames: 8
-  fast_num_frames: 32
+  rgb_dir: "datasets/NTU/original"   # rgb path
+  ir_dir: "datasets/NTU/original_ir"     # ir path
+  batch_size: 12
+  num_workers: 2
+  slow_num_frames: 12
+  fast_num_frames: 48
   side_size: 256
 
 model:
-  feature_dim: 2304                     # SlowFast输出特征维度，根据实际模型调整
-  num_classes: 60                       # NTU RGB+D 类别数
-  rgb_weight: "weights/SLOWFAST_8x8_R50.pyth"
-  ir_weight: null                       # IR 分支权重，若None则随机初始化
+  type: "x3d"
+  variant: "s"
+  feature_dim: 192
+  num_classes: 60
+  rgb_weight: "weights/X3D_S.pyth"
+  ir_weight: "weights/X3D_S.pyth"
   dropout: 0.5
-  hidden_dim: 512                       # 分类头隐藏层维度，None则单层
-  use_reliability: true
+  hidden_dim: 512
+
 train:
-  epochs: 25
-  lr: 0.0001
+  epochs: 80
+  lr: 0.0005
   weight_decay: 0.0001
-  warmup_epochs: 5
+  warmup_epochs: 3
   grad_clip: 1.0
-  use_amp: true                         # 混合精度训练
+  use_amp: true
   seed: 42
   save_dir: "checkpoints"
   log_interval: 10
   eval_interval: 1
 
 tensorboard:
-  log_dir: "tensorboard"                 # TensorBoard日志目录
+  log_dir: "tensorboard"
 
 wandb:
   project: "multimodal-behavior-recognition"
-  entity: null                          # 可选
-  name: null                            # 自动生成
+  entity: null
+  name: null

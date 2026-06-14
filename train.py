@@ -61,7 +61,8 @@ def create_dataloaders(config):
 def create_model(config, device):
     """Create the model and move it to the target device."""
     model = MultiModalModel(
-        use_reliability=config['model'].get('use_reliability', True),
+        model_type=config['model'].get('type', 'slowfast'),
+        model_variant=config['model'].get('variant', None),
         rgb_weight=config['model']['rgb_weight'],
         ir_weight=config['model']['ir_weight'],
         feature_dim=config['model']['feature_dim'],
@@ -260,12 +261,28 @@ def main(config_path, resume_path=None, load_optimizer=True):
     # Model
     model = create_model(config, device)
 
-    # Optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config['train']['lr'],
-        weight_decay=config['train']['weight_decay']
-    )
+    # Optimizer with layer-wise learning rates
+    base_lr = config['train']['lr']
+    wd = config['train']['weight_decay']
+
+    # RGB fine-tune params (later stages) → lower lr
+    # Other params (IR, fusion, head) → base lr
+    rgb_finetune_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'rgb_extractor' in name and 'blocks' in name:
+            rgb_finetune_params.append(param)
+        else:
+            other_params.append(param)
+
+    optimizer = AdamW([
+        {'params': other_params,       'lr': base_lr},
+        {'params': rgb_finetune_params, 'lr': base_lr * 0.1},
+    ], lr=base_lr, weight_decay=wd)
+    print(f"RGB fine-tune params: {sum(p.numel() for p in rgb_finetune_params):,}")
+    print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
 
     # Learning rate schedule (warmup + cosine annealing)
     warmup_epochs = config['train']['warmup_epochs']

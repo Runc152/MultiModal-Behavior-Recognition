@@ -27,4 +27,4 @@ Thumbs.db
 # Other
 *.bak
 *.tmp
-*.swp
+*.swpweights/*.pyth
